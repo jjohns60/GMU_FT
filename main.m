@@ -43,16 +43,21 @@
 % 
 %   - Rutgers Northern Hemisphere 24 km Weekly Snow Cover Extent, 
 %     September 1980 Onward, Version 1
+%   
+%   - **SSMIS rSIR-Enhanced brightness temps
+%
+%   - **ANCILLARY INPUTS (land cover, elevation, etc...) -> & how these 
+%     were processed
 % 
 % (2) Also, specify targeted start and end data of processing. This is in 
 %     the form of a datetime array [dt_start dt_end] inclusive. If there is
 %     not sufficient data to predict for a given data, will return outputs
-%     as fill values (99)
+%     as fill values (NaNs)
 %
 %-------------------------------------------------------------------------%
 % Outputs (2x daily, at 0.05 degree):
 %   (1) Gridded binary FT classifications [frozen = 1, thawed = 0, 
-%       fill = 99]
+%       fill = NaN]
 %   (2) Gridded probability of frozen [0% - 0 -> 100% - 1]
 %   (3) Flags: 
 %           0: no flag
@@ -60,7 +65,9 @@
 %           2: if not 1, probability of frozen between (25 - 75% (moderate
 %              uncertainty)
 %           3: ice cap (Koppen Climate Class 30), always frozen
-%
+%           4: Non-FT constrained climate regions, non-classified
+%           5: Water, as defined by 0.05 degree cells with >50% surface
+%              water cover
 %-------------------------------------------------------------------------%
 %
 % TO DO:
@@ -76,11 +83,11 @@ clc
 %% INPUTS
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% (1) input range of dates to model [datetime_start datetime_end]
-processing_range = [datetime(2020,1,1) datetime(2020,12,31)];
+processing_range = [datetime(2021,1,1) datetime(2021,9,6)];
 
 %% (2) input paths
 %save path
-save_path = '/Volumes/GMU_FT/MODEL/OUTPUTS/';
+save_path = '/Volumes/GMU_FT/MODEL/GMU-FT_V1/';
 
 %path to trained models
 model_path = '/Volumes/GMU_FT/MODEL/TrainedModels/';
@@ -92,22 +99,25 @@ static_predictors_path = '/Volumes/GMU_FT/MODEL/ancillary_files/';
 GSL_path = '/Volumes/GMU_FT/MODEL/GSL_file/';
 
 %path to MODIS NDSI data
-NDSI_path = '/Volumes/GMU_FT/MODEL/NDSI_files/';
+NDSI_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/SNOWCOVER/MODIS10C1/';
 
 %path to land surface temperature data
-LST_path = '/Volumes/GMU_FT/MODEL/LST_files/';
+LST_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/MODIS_LSTv061/';
+
+%path to MODIS land cover data (MCD12C1)
+MODIS_LC_path = '/Volumes/GMU_FT/DATA/ANCILLARY/MODIS_LANDCOVER/';
 
 %path to SMAP 1.41 GHz brightness temperature data (3.125 km EASE grid)
-SMAP_path = '/Volumes/GMU_FT/MODEL/SMAP_files/';
+SMAP_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/SMAP_EASE2_3.125kmNS/';
 
 %path to SSMIS 19 GHz brightness temperature data (6.25 km EASE grid)
-SSMIS19_path = '/Volumes/GMU_FT/MODEL/SSMIS_19files/';
+SSMIS19_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/SSMIS_EASE2_6.25kmNS_19VH/';
 
 %path to SSMIS 22 GHz brightness temperature data (6.25 km EASE grid)
-SSMIS22_path = '/Volumes/GMU_FT/MODEL/SSMIS_22files/';
+SSMIS22_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/SSMIS_EASE2_6.25kmNS_22V/';
 
 %path to SSMIS 37 GHz brightness temperature data (3.125 km EASE grid)
-SSMIS37_path = '/Volumes/GMU_FT/MODEL/SSMIS_37files/';
+SSMIS37_path = '/Volumes/GMU_FT/DATA/SATELLITE/TRAINING/SSMIS_EASE2_3.125kmNS_37H/';
 
 %paths to relevant EASE2 grid information
 EASE2_N3km_path = '/Volumes/GMU_FT/MODEL/grids/EASE2_N3.125km.geolocation.v0.9.nc';
@@ -115,13 +125,6 @@ EASE2_S3km_path = '/Volumes/GMU_FT/MODEL/grids/EASE2_S3.125km.geolocation.v0.9.n
 EASE2_N6km_path = '/Volumes/GMU_FT/MODEL/grids/EASE2_N6.25km.geolocation.v0.9.nc';
 EASE2_S6km_path = '/Volumes/GMU_FT/MODEL/grids/EASE2_S6.25km.geolocation.v0.9.nc';
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-
-
-
-
-
-
 
 
 
@@ -147,16 +150,13 @@ n = fieldnames(RF_Mdl_C03); RF_Mdl_C03 = RF_Mdl_C03.(n{1});
 
 
 %load in static predictors
+% KC_Beck_10class -> Koppen Beck present day climate classifications converted to 10 classes, 0.05 degree (2018)
+% KC30_N_05 -> Number of unique climate classes within each 0.05 grid, using 1/120-degree (~1km) resolution data from above (2018)
+% aspect -> from ETOPO 1/60 (0.0167) degree gridded data computed at 0.05 degrees
+% TPI -> terrain prominence taken as the difference between the cell center and average of all 3 x 3 cells (or 0.05 degree area, normalized -150 (0) to 150 (1))
+% elev_sd_05 -> elevation standard deviation within each 0.05 degree cell (using 1/60 degree data)
+% LC_MODIS_IGBP, forest_proportion, and water_proportion (DEFAULT 2017) land cover values (13 classes) and estimated forest percentage and water cover percentage by 0.05 pixel.
 staticVars = getStaticPredictors(static_predictors_path);
-
-%Create data masks
-%climate-based masking
-climate_mask = staticVars.KC_Beck_10class == 1 | staticVars.KC_Beck_10class == 2 | ...
-    staticVars.KC_Beck_10class == 5;
-%masking of water dominated cells
-water_mask = staticVars.water_proportion > 0.5;
-%Always frozen mask
-alwaysFZ_mask = staticVars.LC_MODIS_IGBP13 == 11;
 
 %load in grid data to structures
 EASE2_N3km.latitude = ncread(EASE2_N3km_path,'latitude'); EASE2_N3km.longitude = ncread(EASE2_N3km_path,'longitude');
@@ -166,10 +166,35 @@ EASE2_S6km.latitude = ncread(EASE2_S6km_path,'latitude'); EASE2_S6km.longitude =
 
 %loop through each day for deriving 2x daily model outputs
 dates_to_process = processing_range(1):processing_range(2);
-for i = 220:length(dates_to_process)
+for i = 1:length(dates_to_process)
     tic
     %get specific date
     date_i = dates_to_process(i);
+    
+    %check if entering a new year (previous day is within different year)
+    if (year(date_i) ~= year(date_i - 1)) || i == 1
+        disp(['Getting Land Cover Data for ' num2str(year(date_i))])
+        %identify proper MODIS land cover file to use (return path to file)
+        modis_file = findMODIS_LC_file(MODIS_LC_path,date_i);
+        
+        %extract 0.05 degree 13-class land cover,forest proportion, and
+        %water proportion
+        [LC_MODIS_IGBP13,forest_proportion,water_proportion] = getMODISLandCover(modis_file);
+        staticVars.LC_MODIS_IGBP13 = LC_MODIS_IGBP13;
+        staticVars.forest_proportion = forest_proportion;
+        staticVars.water_proportion = water_proportion;
+        
+        %Create data masks
+        %climate-based masking
+        climate_mask = staticVars.KC_Beck_10class == 1 | staticVars.KC_Beck_10class == 2 | ...
+            staticVars.KC_Beck_10class == 5;
+        %masking of water dominated cells
+        water_mask = staticVars.water_proportion > 0.5;
+        %Always frozen mask
+        alwaysFZ_mask = staticVars.LC_MODIS_IGBP13 == 11;
+        
+        disp('Completed')
+    end
     
     %identify files relevant to given date
     %(hemispheric (2) x overpass (2) x number of bands (n))
@@ -253,7 +278,7 @@ for i = 220:length(dates_to_process)
     idx03 = staticVars.KC_Beck_10class == 3;
     [~,P03] = predict(RF_Mdl_C03,T(T.KC10 == 3,2:end));
     
-    %combine into grid of all binart FT values
+    %combine into grid of all binary FT values
     M_FZp = NaN([3600 7200]);
     M_FZp(idx10) = P10(:,2);
     M_FZp(idx09) = P09(:,2);
